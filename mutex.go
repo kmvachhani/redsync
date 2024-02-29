@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-redsync/redsync/v4/redis"
 	"github.com/hashicorp/go-multierror"
+	"github.com/rs/zerolog"
 )
 
 // A DelayFunc is used to decide the amount of time to wait between retries.
@@ -73,12 +74,14 @@ func (m *Mutex) LockContext(ctx context.Context) error {
 
 // lockContext locks m. In case it returns an error on failure, you may retry to acquire the lock by calling this method again.
 func (m *Mutex) lockContext(ctx context.Context, tries int) error {
+	logger := zerolog.Ctx(ctx).With().Str("redsync", "lockContext").Logger()
 	if ctx == nil {
 		ctx = context.Background()
 	}
 
 	value, err := m.genValueFunc()
 	if err != nil {
+		logger.Error().Err(err).Msg("failed to generate value")
 		return err
 	}
 
@@ -95,6 +98,7 @@ func (m *Mutex) lockContext(ctx context.Context, tries int) error {
 			case <-ctx.Done():
 				timer.Stop()
 				// Exit early if the context is done.
+				logger.Warn().Msg("context done, exiting")
 				return ErrFailed
 			case <-timer.C:
 				// Fall-through when the delay timer completes.
@@ -126,10 +130,12 @@ func (m *Mutex) lockContext(ctx context.Context, tries int) error {
 			})
 		}()
 		if i == m.tries-1 && err != nil {
+			logger.Warn().Msg("failed to release lock")
 			return err
 		}
 	}
 
+	logger.Warn().Msg("failed to acquire lock, returning ErrFailed")
 	return ErrFailed
 }
 
@@ -219,13 +225,16 @@ func genValue() (string, error) {
 }
 
 func (m *Mutex) acquire(ctx context.Context, pool redis.Pool, value string) (bool, error) {
+	logger := zerolog.Ctx(ctx).With().Str("redsync", "acquire").Logger()
 	conn, err := pool.Get(ctx)
 	if err != nil {
+		logger.Error().Err(err).Msg("failed to get connection")
 		return false, err
 	}
 	defer conn.Close()
 	reply, err := conn.SetNX(m.name, value, m.expiry)
 	if err != nil {
+		logger.Error().Err(err).Msg("failed to setnx")
 		return false, err
 	}
 	return reply, nil
@@ -243,16 +252,20 @@ var deleteScript = redis.NewScript(1, `
 `)
 
 func (m *Mutex) release(ctx context.Context, pool redis.Pool, value string) (bool, error) {
+	logger := zerolog.Ctx(ctx).With().Str("redsync", "release").Logger()
 	conn, err := pool.Get(ctx)
 	if err != nil {
+		logger.Error().Err(err).Msg("failed to get connection")
 		return false, err
 	}
 	defer conn.Close()
 	status, err := conn.Eval(deleteScript, m.name, value)
 	if err != nil {
+		logger.Error().Err(err).Msg("failed to eval")
 		return false, err
 	}
 	if status == int64(-1) {
+		logger.Warn().Msg("lock already expired")
 		return false, ErrLockAlreadyExpired
 	}
 	return status != int64(0), nil
